@@ -1,0 +1,218 @@
+# Default training configuration
+
+defaults:
+  - default_dataset.yaml
+  - _self_
+
+exp_name: exp_name
+img_size: 518
+num_workers: 4
+seed_value: 42
+accum_steps: 12
+patch_size: 14
+embed_dim: 1024
+val_epoch_freq: 5
+max_img_per_gpu: 144
+max_img_per_gpu_val: 144
+
+limit_train_batches: null
+limit_val_batches: null
+
+
+data:
+  train:
+    _target_: data.dynamic_dataloader.DynamicTorchDataset
+    num_workers: ${num_workers}
+    max_img_per_gpu: ${max_img_per_gpu}
+    common_config:
+      img_size: ${img_size}
+      patch_size: ${patch_size}
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        - _target_: data.datasets.stanford2d3ds.Stanford2D3DSDataset
+          split: train
+          Stanford2D3DS_DIR: /public/home/shiyj2-group/yijing/panorama/2d3ds/no_xyz
+          len_train: 2400
+          get_nearby: False
+        - _target_: data.datasets.matterport3d.Matterport3DDataset
+          split: train
+          Matterport3D_DIR: /public/home/shiyj2-group/yijing/panorama/matterport3D
+          len_train: 4800
+          get_nearby: False
+        - _target_: data.datasets.structured3d.Structured3DDataset
+          split: train
+          Structured3D_DIR: /public/home/shiyj2-group/yijing/panorama/Structured3D_Dataset/Structured3D
+          len_train: 2400
+          get_nearby: False
+        - _target_: data.datasets.panocity.PanoCityDataset
+          split: train
+          PanoCity_DIR: /public/home/shiyj2-group/yijing/panorama/panocity
+          len_train: 16800
+          get_nearby: True
+          
+  val:
+    _target_: data.dynamic_dataloader.DynamicTorchDataset
+    num_workers: ${num_workers}
+    max_img_per_gpu: ${max_img_per_gpu_val}
+    common_config:
+      img_size: ${img_size}
+      patch_size: ${patch_size}
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        - _target_: data.datasets.stanford2d3ds.Stanford2D3DSDataset
+          split: test
+          Stanford2D3DS_DIR: /public/home/shiyj2-group/yijing/panorama/2d3ds/no_xyz
+          len_test: 240
+        - _target_: data.datasets.matterport3d.Matterport3DDataset
+          split: test
+          Matterport3D_DIR: /public/home/shiyj2-group/yijing/panorama/matterport3D
+          len_test: 480
+        - _target_: data.datasets.structured3d.Structured3DDataset
+          split: test
+          Structured3D_DIR: /public/home/shiyj2-group/yijing/panorama/Structured3D_Dataset/Structured3D
+          len_test: 1400
+        - _target_: data.datasets.panocity.PanoCityDataset
+          split: test
+          PanoCity_DIR: /public/home/shiyj2-group/yijing/panorama/panocity
+          len_test: 2400
+
+
+logging:
+  log_dir: /public/home/v-guoyj/workspace/panopd/logs
+  log_exp: ${exp_name}
+  log_visuals: False
+  log_freq: 1
+  log_level_primary: DEBUG
+  log_level_secondary: WARNING
+  all_ranks: True
+  tensorboard_writer:
+    _target_: train_utils.tb_writer.TensorBoardLogger
+    path: ${logging.log_dir}/tensorboard/${exp_name}
+  scalar_keys_to_log:
+    train:
+      keys_to_log:
+        - loss_objective
+        - loss_camera
+        - loss_T
+        - loss_R
+        - loss_reg_point
+        - loss_grad_point
+        - loss_local_point
+        - loss_global_point
+    val:
+      keys_to_log:
+        - loss_objective
+        - loss_camera
+        - loss_T
+        - loss_R
+        - loss_reg_point
+        - loss_grad_point
+        - loss_local_point
+        - loss_global_point
+
+
+checkpoint:
+  save_dir: /public/home/v-guoyj/workspace/panopd/logs/${exp_name}/ckpts
+  save_freq: 5
+  resume_checkpoint_path: null
+  strict: False
+
+
+loss:
+  _target_: panovggt.models.loss.Loss
+  train_conf: ${model.train_conf}
+
+
+optim:
+  param_group_modifiers: False
+
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 5e-6
+    weight_decay: 0.05
+
+  frozen_module_names: []
+
+  amp:
+    enabled: True
+    amp_dtype: bfloat16
+    
+  gradient_clip:
+    _target_: train_utils.gradient_clip.GradientClipper
+    configs:
+      - module_name: ["aggregator"]
+        max_norm: 1.0
+        norm_type: 2
+      - module_name: ["conf"]
+        max_norm: 1.0
+        norm_type: 2
+      - module_name: ["camera"]
+        max_norm: 1.0
+        norm_type: 2
+      - module_name: ["point"]
+        max_norm: 1.0
+        norm_type: 2
+      - module_name: ["pos"]
+        max_norm: 1.0
+        norm_type: 2
+        
+  options:
+    lr:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.CompositeParamScheduler
+          schedulers:
+            - _target_: fvcore.common.param_scheduler.LinearParamScheduler
+              start_value: 1e-8
+              end_value: 5e-6
+            - _target_: fvcore.common.param_scheduler.CosineParamScheduler
+              start_value: 5e-6
+              end_value: 1e-8
+          lengths: [0.15, 0.85]
+          interval_scaling: ['rescaled', 'rescaled']
+    weight_decay:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+          value: 0.05
+
+
+max_epochs: 50
+
+model:
+  _target_: panovggt.models.panovggt_model.PanoVGGTModel
+  img_size: ${img_size}
+  patch_size: ${patch_size}
+  embed_dim: ${embed_dim}
+  enable_camera: True
+  enable_depth: True
+  enable_point: True
+  enable_track: False
+  train_conf: False
+  aggregator:
+    depth: 36
+    num_heads: 16
+    mlp_ratio: 4.0
+    patch_embed: "dinov2_vitl14_reg"
+    num_register_tokens: 5
+    qkv_bias: True
+    proj_bias: True
+    ffn_bias: True
+    qk_norm: True
+    rope_freq: 100
+    init_values: 0.01
+
+
+distributed:
+  backend: nccl
+  comms_dtype: None
+  find_unused_parameters: False
+  timeout_mins: 10
+  gradient_as_bucket_view: True
+  bucket_cap_mb: 25
+  broadcast_buffers: False
+
+cuda:
+  cudnn_deterministic: False
+  cudnn_benchmark: False
+  allow_tf32: True

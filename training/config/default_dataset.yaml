@@ -1,0 +1,106 @@
+# Default panoramic dataset config template.
+# Define shared parameters only; do not define concrete dataset lists here.
+
+data:
+  train:
+    _target_: data.dynamic_dataloader.DynamicTorchDataset
+    num_workers: 8
+    max_img_per_gpu: 96
+    shuffle: False
+    pin_memory: False
+    drop_last: True
+    persistent_workers: False
+    seed: 42
+
+    common_config:
+      # Basic parameters
+      img_size: 336
+      patch_size: 14
+      training: True
+      debug: False
+
+      # Sampling strategy
+      inside_random: True
+      get_nearby: True
+      allow_duplicate_img: True
+
+      # Number of images per sample
+      fix_img_num: -1
+      img_nums: [2, 12]
+
+      # Aspect ratio control
+      fix_aspect_ratio: -1
+
+      # Depth and tracking options
+      load_depth: True
+      load_track: False
+      track_num: 512
+
+      # Resize options
+      rescale: False
+      rescale_aug: False
+      landscape_check: False
+
+      # Debug options
+      repeat_batch: False
+
+      # Data augmentation
+      augs:
+        color_aug: True
+        rand_gamma:
+          min: 0.8
+          max: 1.2
+        aspects: [0.5, 1.0]
+        pitch:    # +/- degrees, 0 means disabled
+          sample_angle: 15.0  # +/- degrees, 0 means disabled
+        yaw:      # random yaw rotation
+          sample_angle: 180.0
+        roll:      # +/- degrees, 0 means disabled
+          sample_angle: 15.0
+
+
+    # Do not define dataset entries here.
+    # Dataset lists are defined in experiment-specific config files.
+
+  # Validation configuration
+  val:
+    _target_: data.dynamic_dataloader.DynamicTorchDataset
+    num_workers: 8
+    max_img_per_gpu: 48
+    shuffle: False
+    pin_memory: False
+    drop_last: False
+    persistent_workers: False
+    seed: 42
+
+    common_config:
+      img_size: 336
+      patch_size: 14
+      training: False
+      debug: False
+
+      inside_random: True
+      get_nearby: False
+      allow_duplicate_img: True
+
+      fix_img_num: -1
+      img_nums: [2, 12]
+
+      fix_aspect_ratio: -1
+
+      load_depth: True
+      load_track: False
+      track_num: 512
+
+      rescale: False
+      rescale_aug: False
+      landscape_check: False
+
+      augs:
+        color_aug: False
+        aspects: [0.75, 1.0]
+        # pitch: 0.0
+        # yaw: 180.0    # no rotation for validation
+        # roll: 0.0
+
+    # Likewise, do not define dataset entries here.

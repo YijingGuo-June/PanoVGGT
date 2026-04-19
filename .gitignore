@@ -1,0 +1,53 @@
+# Project runtime outputs
+.hydra/
+output/
+outputs/
+ckpt/
+ckpt*/
+logs/
+logs*/
+input*/
+**/tmp/
+
+# Python cache and artifacts
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.prof
+
+# Build / packaging
+build/
+dist/
+.eggs/
+*.egg-info/
+pip-wheel-metadata/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Environments
+.env
+.venv/
+venv/
+ENV/
+.pixi/
+.conda/
+.python-version
+
+# Editors / notebooks
+.idea/
+.vscode/
+.ipynb_checkpoints/
+
+# Dataset / visualization artifacts
+*.ply
+**/outputs/skyseg.onnx
+skyseg.onnx
+
+# OS
+.DS_Store
