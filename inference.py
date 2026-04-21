@@ -3,13 +3,20 @@
 PanoVGGT — Inference Script
 Input  : panoramic images + optional masks (black = invalid)
 Output : depth maps, camera poses (rotation matrices), per-frame PLY, merged PLY
+
+python inference.py \
+    --config  training/config/default.yaml \
+    --checkpoint training/checkpoints/model.pt \
+    --image_dir  data/image \
+    --mask_dir   data/image_mask \
+    --output_dir results
+
 """
 
 import os
-import sys
 import argparse
+import contextlib
 import glob
-import math
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -19,9 +26,12 @@ import torch
 from omegaconf import OmegaConf
 
 from panovggt.models.panovggt_model import PanoVGGTModel
-from panovggt.utils.basic import load_images_as_tensor
 
 _IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
+
+# 固定输入分辨率 (H=518, W=1036，宽高比 2:1，均能被 patch_size=14 整除)
+_INPUT_H = 518
+_INPUT_W = 1036
 
 
 # =========================================================================
@@ -71,24 +81,35 @@ def collect_images(image_dir: str) -> List[str]:
     return paths
 
 
-def collect_masks(mask_dir: Optional[str], image_paths: List[str]) -> Optional[List[Optional[str]]]:
-    """
-    Match mask files to image files by stem name.
-    Returns None if mask_dir is None, else a list (same length as image_paths)
-    where each element is either a path string or None.
-    """
+def collect_masks(
+    mask_dir: Optional[str],
+    image_paths: List[str],
+) -> Optional[List[Optional[str]]]:
     if mask_dir is None:
         return None
 
-    mask_map = {}
+    mask_map: dict = {}
     for p in glob.glob(os.path.join(mask_dir, "*")):
         if os.path.splitext(p)[1].lower() in _IMG_EXTS:
-            mask_map[Path(p).stem] = p
+            stem = Path(p).stem
+            # 去掉常见的 mask 后缀，统一用图片 stem 作为 key
+            for suffix in ("_mask", "-mask", "_Mask", "-Mask"):
+                if stem.endswith(suffix):
+                    stem = stem[: -len(suffix)]
+                    break
+            mask_map[stem] = p
+
+    # Debug
+    print(f"[mask] image stems : {[Path(p).stem for p in image_paths]}")
+    print(f"[mask] mask  stems (normalised) : {sorted(mask_map.keys())}")
 
     result = []
     for img_path in image_paths:
         stem = Path(img_path).stem
-        result.append(mask_map.get(stem, None))
+        matched = mask_map.get(stem, None)
+        if matched is None:
+            print(f"  [mask] WARNING: no mask found for '{stem}'")
+        result.append(matched)
     return result
 
 
@@ -106,12 +127,33 @@ def load_mask(mask_path: Optional[str], H: int, W: int) -> Optional[np.ndarray]:
         return None
     mask_bgr = cv2.resize(mask_bgr, (W, H), interpolation=cv2.INTER_NEAREST)
     # valid where at least one channel > 0
-    valid = np.any(mask_bgr > 0, axis=-1)   # (H, W) bool
+    valid = np.any(mask_bgr > 0, axis=-1)  # (H, W) bool
     return valid
 
 
 # =========================================================================
-#  3.  Depth Visualisation
+#  3.  Image Loading  (fixed 518 × 1036)
+# =========================================================================
+
+def load_images_fixed(image_paths: List[str]) -> torch.Tensor:
+    """
+    Load images, resize each to (_INPUT_H, _INPUT_W), normalise to [0,1].
+    Returns float32 tensor of shape (S, 3, _INPUT_H, _INPUT_W).
+    """
+    frames = []
+    for p in image_paths:
+        bgr = cv2.imread(p)
+        if bgr is None:
+            raise IOError(f"Cannot read image: {p}")
+        bgr = cv2.resize(bgr, (_INPUT_W, _INPUT_H), interpolation=cv2.INTER_AREA)
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        # (H, W, 3) → (3, H, W)
+        frames.append(torch.from_numpy(rgb).permute(2, 0, 1))
+    return torch.stack(frames, dim=0)  # (S, 3, H, W)
+
+
+# =========================================================================
+#  4.  Depth Visualisation
 # =========================================================================
 
 def depth_to_colormap(
@@ -139,7 +181,6 @@ def depth_to_colormap(
     else:
         d_norm = ((d - d_min) / (d_max - d_min) * 255).astype(np.uint8)
 
-    # nan → 0 before colormap
     d_norm = np.nan_to_num(d_norm, nan=0).astype(np.uint8)
     colored = cv2.applyColorMap(d_norm, colormap)
 
@@ -150,7 +191,7 @@ def depth_to_colormap(
 
 
 # =========================================================================
-#  4.  Point Cloud Helpers
+#  5.  Point Cloud Helpers
 # =========================================================================
 
 def points_and_colors_from_frame(
@@ -160,77 +201,113 @@ def points_and_colors_from_frame(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Flatten (H, W, 3) points and image arrays, applying optional mask.
-    Returns (N, 3) xyz and (N, 3) rgb (uint8).
+    Returns (N, 3) xyz and (N, 3) rgb uint8.
     """
     H, W, _ = points_hw3.shape
     mask = valid_mask if valid_mask is not None else np.ones((H, W), dtype=bool)
 
-    # additional validity: discard points with zero depth / NaN
+    # discard zero-depth / NaN points
     depth = np.linalg.norm(points_hw3, axis=-1)
     mask = mask & (depth > 0) & np.isfinite(depth)
 
-    xyz = points_hw3[mask]                    # (N, 3)
-    rgb = (image_hw3[mask] * 255).astype(np.uint8) if image_hw3.max() <= 1.0 \
-          else image_hw3[mask].astype(np.uint8)
+    xyz = points_hw3[mask]  # (N, 3)
+    if image_hw3.max() <= 1.0:
+        rgb = (image_hw3[mask] * 255).astype(np.uint8)
+    else:
+        rgb = image_hw3[mask].astype(np.uint8)
 
     return xyz, rgb
 
 
 def save_ply(path: str, xyz: np.ndarray, rgb: np.ndarray) -> None:
-    """Write a coloured point cloud to a PLY file (ASCII)."""
+    """Write a coloured point cloud to a PLY file (binary little-endian for speed)."""
     assert xyz.shape[0] == rgb.shape[0], "xyz / rgb length mismatch"
     N = xyz.shape[0]
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "w") as f:
-        f.write("ply\nformat ascii 1.0\n")
-        f.write(f"element vertex {N}\n")
-        f.write("property float x\nproperty float y\nproperty float z\n")
-        f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
-        f.write("end_header\n")
-        for i in range(N):
-            x, y, z = xyz[i]
-            r, g, b = rgb[i]
-            f.write(f"{x:.6f} {y:.6f} {z:.6f} {int(r)} {int(g)} {int(b)}\n")
+
+    xyz = xyz.astype(np.float32)
+    rgb = rgb.astype(np.uint8)
+
+    with open(path, "wb") as f:
+        header = (
+            "ply\n"
+            "format binary_little_endian 1.0\n"
+            f"element vertex {N}\n"
+            "property float x\n"
+            "property float y\n"
+            "property float z\n"
+            "property uchar red\n"
+            "property uchar green\n"
+            "property uchar blue\n"
+            "end_header\n"
+        )
+        f.write(header.encode("ascii"))
+        # interleave xyz (float32 × 3) and rgb (uint8 × 3) per vertex
+        data = np.empty(N, dtype=[
+            ("x", np.float32), ("y", np.float32), ("z", np.float32),
+            ("r", np.uint8),   ("g", np.uint8),   ("b", np.uint8),
+        ])
+        data["x"] = xyz[:, 0]
+        data["y"] = xyz[:, 1]
+        data["z"] = xyz[:, 2]
+        data["r"] = rgb[:, 0]
+        data["g"] = rgb[:, 1]
+        data["b"] = rgb[:, 2]
+        f.write(data.tobytes())
+
     print(f"  [ply] saved {N:,} points → {path}")
 
 
 # =========================================================================
-#  5.  Inference
+#  6.  Inference
 # =========================================================================
 
 def run_inference(
     model: PanoVGGTModel,
-    image_dir: str,
+    image_paths: List[str],
     device: str,
 ) -> dict:
-    """Run PanoVGGT on all images in image_dir. Returns raw prediction dict."""
-    imgs = load_images_as_tensor(image_dir, interval=1).to(device)
-    print(f"[infer] Input tensor shape: {imgs.shape}")
+    """
+    Run PanoVGGT on the given image paths.
+    Images are resized to (_INPUT_H, _INPUT_W) = (518, 1036) before inference.
+    Returns a dict of numpy arrays (batch dim already squeezed).
+    """
+    imgs = load_images_fixed(image_paths).to(device)
+    print(f"[infer] Input tensor shape: {imgs.shape}  "
+          f"(S={imgs.shape[0]}, C=3, H={_INPUT_H}, W={_INPUT_W})")
 
-    with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
-        preds = model(imgs[None])   # add batch dim → (1, S, C, H, W)
+    # autocast only on CUDA
+    amp_ctx = (
+        torch.amp.autocast("cuda", dtype=torch.bfloat16)
+        if device == "cuda"
+        else contextlib.nullcontext()
+    )
 
-    # Convert bfloat16 → float32, move to CPU
-    out = {}
+    with torch.no_grad(), amp_ctx:
+        # imgs: (S, 3, H, W) → add batch dim → (1, S, 3, H, W)
+        preds = model(imgs.unsqueeze(0))
+
+    # Convert to float32 CPU numpy, squeeze batch dim
+    out: dict = {}
     for k, v in preds.items():
         if isinstance(v, torch.Tensor):
-            out[k] = (v.float() if v.dtype == torch.bfloat16 else v).cpu()
+            v_f = v.float() if v.dtype == torch.bfloat16 else v
+            v_cpu = v_f.cpu()
+            # squeeze leading batch dim if present
+            if v_cpu.dim() >= 1 and v_cpu.shape[0] == 1:
+                v_cpu = v_cpu.squeeze(0)
+            out[k] = v_cpu.numpy()
         else:
             out[k] = v
-
-    # squeeze batch dim
-    for k in list(out.keys()):
-        if isinstance(out[k], torch.Tensor) and out[k].shape[0] == 1:
-            out[k] = out[k].squeeze(0)
 
     return out
 
 
 # =========================================================================
-#  6.  Main Pipeline
+#  7.  Main Pipeline
 # =========================================================================
 
-def main(args):
+def main(args: argparse.Namespace) -> None:
     # ── device ────────────────────────────────────────────────────────────
     device = args.device
     if device == "cuda" and not torch.cuda.is_available():
@@ -249,9 +326,9 @@ def main(args):
     # ── collect inputs ────────────────────────────────────────────────────
     image_paths = collect_images(args.image_dir)
     mask_paths  = collect_masks(args.mask_dir, image_paths)
-    S           = len(image_paths)
+    S = len(image_paths)
     print(f"[pipeline] {S} image(s) found.")
-    if mask_paths:
+    if mask_paths is not None:
         n_masks = sum(1 for m in mask_paths if m is not None)
         print(f"[pipeline] {n_masks}/{S} mask(s) matched.")
 
@@ -259,70 +336,51 @@ def main(args):
     model = load_model(args.config, args.checkpoint, device)
     model.eval().to(device)
     print(f"[pipeline] Model ready on {device}.")
+    print(f"[pipeline] Fixed input resolution: H={_INPUT_H}, W={_INPUT_W}")
 
     # ── inference ─────────────────────────────────────────────────────────
-    # load_images_as_tensor expects a directory; we use args.image_dir directly
-    preds = run_inference(model, args.image_dir, device)
+    preds = run_inference(model, image_paths, device)
 
-    # ── decode outputs ────────────────────────────────────────────────────
-    # preds shapes (after squeeze):
-    #   depth         : (S, H, W) or (S, H, W, 1)
-    #   local_points  : (S, H, W, 3)
-    #   world_points  : (S, H, W, 3)   ← preferred for merged cloud
-    #   camera_poses  : (S, 4, 4)
-    #   images        : (S, C, H, W)   raw input tensor
+    # ── unpack predictions ────────────────────────────────────────────────
+    # After squeeze, expected shapes:
+    #   depth        : (S, H, W) or (S, H, W, 1)
+    #   local_points : (S, H, W, 3)   — camera / local frame
+    #   world_points : (S, H, W, 3)   — world frame  (preferred for merged cloud)
+    #   camera_poses : (S, 4, 4)
+    #   images       : (S, C, H, W) or (S, H, W, C)  — model's view of the input
 
-    # depth
-    depth_np = None
+    # depth  (S, H, W)
+    depth_np: Optional[np.ndarray] = None
     if "depth" in preds and preds["depth"] is not None:
-        depth_np = preds["depth"].numpy()               # (S, H, W) or (S, H, W, 1)
-        if depth_np.ndim == 4:
-            depth_np = depth_np[..., 0]                 # → (S, H, W)
+        depth_np = preds["depth"]
+        if depth_np.ndim == 4:          # (S, H, W, 1) → (S, H, W)
+            depth_np = depth_np[..., 0]
 
-    # points in world frame (used for merged cloud)
-    world_pts_np = None
+    # world-frame points  (S, H, W, 3)
+    world_pts_np: Optional[np.ndarray] = None
     if "world_points" in preds and preds["world_points"] is not None:
-        world_pts_np = preds["world_points"].numpy()    # (S, H, W, 3)
+        world_pts_np = preds["world_points"]
     elif "points" in preds and preds["points"] is not None:
-        world_pts_np = preds["points"].numpy()
+        world_pts_np = preds["points"]
 
-    # points in local/camera frame (used for per-frame cloud)
-    local_pts_np = None
+    # local-frame points  (S, H, W, 3)
+    local_pts_np: Optional[np.ndarray] = None
     if "local_points" in preds and preds["local_points"] is not None:
-        local_pts_np = preds["local_points"].numpy()    # (S, H, W, 3)
+        local_pts_np = preds["local_points"]
     elif world_pts_np is not None:
-        local_pts_np = world_pts_np                     # fall back
+        local_pts_np = world_pts_np     # fall back
 
     # camera poses  (S, 4, 4)
-    poses_np = None
+    poses_np: Optional[np.ndarray] = None
     if "camera_poses" in preds and preds["camera_poses"] is not None:
-        poses_np = preds["camera_poses"].numpy()
+        poses_np = preds["camera_poses"]
 
-    # input images normalised to [0, 1], shape (S, C, H, W) or (S, H, W, C)
-    images_raw = None
-    if "images" in preds and preds["images"] is not None:
-        images_raw = preds["images"]
-        if isinstance(images_raw, torch.Tensor):
-            images_raw = images_raw.numpy()
-        if images_raw.ndim == 4 and images_raw.shape[1] in (1, 3):
-            # (S, C, H, W) → (S, H, W, C)
-            images_raw = images_raw.transpose(0, 2, 3, 1)
-        if images_raw.max() > 1.0:
-            images_raw = images_raw / 255.0
+    # H, W at inference resolution
+    H, W = _INPUT_H, _INPUT_W
 
-    # derive H, W from depth or points
-    if depth_np is not None:
-        _, H, W = depth_np.shape
-    elif local_pts_np is not None:
-        _, H, W, _ = local_pts_np.shape
-    else:
-        # fall back: read first image
-        tmp = cv2.imread(image_paths[0])
-        H, W = tmp.shape[:2]
+    print(f"[pipeline] Inference frame size: {H} × {W}")
 
-    print(f"[pipeline] Frame size: {H} × {W}")
-
-    # ── per-frame output ──────────────────────────────────────────────────
+    # ── per-frame processing ──────────────────────────────────────────────
     all_xyz: List[np.ndarray] = []
     all_rgb: List[np.ndarray] = []
 
@@ -330,66 +388,83 @@ def main(args):
         stem = Path(img_path).stem
         print(f"\n[frame {i:04d}] {stem}")
 
-        # load original image for colour (RGB, float32 [0,1])
+        # Load original image, resize to inference resolution for colour lookup
         img_bgr = cv2.imread(img_path)
-        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        img_rgb = cv2.resize(img_rgb, (W, H))
+        if img_bgr is None:
+            print(f"  [warn] Cannot read image: {img_path}. Skipping.")
+            continue
+        img_bgr_resized = cv2.resize(img_bgr, (W, H), interpolation=cv2.INTER_AREA)
+        img_rgb = cv2.cvtColor(img_bgr_resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
 
-        # load mask
-        mask_valid = None
+        # Load and resize mask to inference resolution
+        mask_valid: Optional[np.ndarray] = None
         if mask_paths is not None and mask_paths[i] is not None:
             mask_valid = load_mask(mask_paths[i], H, W)
-            print(f"  mask: {mask_paths[i]}  valid={mask_valid.sum():,}/{H*W:,} px")
+            if mask_valid is not None:
+                print(f"  mask: {mask_paths[i]}  "
+                      f"valid={mask_valid.sum():,}/{H * W:,} px "
+                      f"({100.0 * mask_valid.mean():.1f} %)")
         else:
-            print("  mask: (none)")
+            print("  mask: (none — all pixels valid)")
 
         # ── depth map ─────────────────────────────────────────────────────
         if depth_np is not None:
-            d = depth_np[i]                                     # (H, W)
+            d = depth_np[i]                                 # (H, W)
+
+            # coloured visualisation
             colored = depth_to_colormap(
-                d, valid_mask=mask_valid,
+                d,
+                valid_mask=mask_valid,
                 use_log=args.log_depth,
                 colormap=cv2.COLORMAP_TURBO,
             )
             out_depth_path = os.path.join(depth_dir, f"{stem}_depth.png")
             cv2.imwrite(out_depth_path, colored)
 
-            # also save raw depth as 16-bit PNG (millimetres, clamped to 65535)
+            # raw 16-bit depth (millimetres, masked invalid → 0)
             d_mm = (d * 1000.0).astype(np.float32)
             if mask_valid is not None:
                 d_mm[~mask_valid] = 0.0
             d_u16 = np.clip(d_mm, 0, 65535).astype(np.uint16)
-            cv2.imwrite(os.path.join(depth_dir, f"{stem}_depth_raw.png"), d_u16)
+            cv2.imwrite(
+                os.path.join(depth_dir, f"{stem}_depth_raw.png"), d_u16
+            )
             print(f"  depth: saved → {out_depth_path}")
 
         # ── camera pose ───────────────────────────────────────────────────
         if poses_np is not None:
-            pose44 = poses_np[i]                                # (4, 4)
-            R      = pose44[:3, :3]                             # (3, 3)
-            t      = pose44[:3,  3]                             # (3,)
+            pose44 = poses_np[i]                            # (4, 4)
+            R = pose44[:3, :3]                              # (3, 3)
+            t = pose44[:3, 3]                               # (3,)
 
             np.savetxt(
                 os.path.join(pose_dir, f"{stem}_R.txt"), R,
-                fmt="%.8f", header=f"Rotation matrix for frame {i}: {stem}")
+                fmt="%.8f",
+                header=f"Rotation matrix for frame {i}: {stem}",
+            )
             np.savetxt(
-                os.path.join(pose_dir, f"{stem}_t.txt"), t,
-                fmt="%.8f", header=f"Translation for frame {i}: {stem}")
+                os.path.join(pose_dir, f"{stem}_t.txt"), t[np.newaxis],
+                fmt="%.8f",
+                header=f"Translation for frame {i}: {stem}",
+            )
             np.save(os.path.join(pose_dir, f"{stem}_pose.npy"), pose44)
-            print(f"  pose: R saved, t={t}")
+            print(f"  pose: R saved  t={t}")
 
-        # ── per-frame point cloud (local frame) ───────────────────────────
+        # ── per-frame point cloud (local / camera frame) ──────────────────
         if local_pts_np is not None:
-            pts_hw3 = local_pts_np[i]                           # (H, W, 3)
+            pts_hw3 = local_pts_np[i]                       # (H, W, 3)
             xyz, rgb = points_and_colors_from_frame(
-                pts_hw3, img_rgb, valid_mask=mask_valid)
+                pts_hw3, img_rgb, valid_mask=mask_valid
+            )
             ply_path = os.path.join(per_frame_dir, f"{stem}.ply")
             save_ply(ply_path, xyz, rgb)
 
-        # ── accumulate for merged cloud (world frame) ─────────────────────
+        # ── accumulate world-frame points for merged cloud ─────────────────
         if world_pts_np is not None:
-            pts_hw3 = world_pts_np[i]
+            pts_hw3_w = world_pts_np[i]                     # (H, W, 3)
             xyz_w, rgb_w = points_and_colors_from_frame(
-                pts_hw3, img_rgb, valid_mask=mask_valid)
+                pts_hw3_w, img_rgb, valid_mask=mask_valid
+            )
             all_xyz.append(xyz_w)
             all_rgb.append(rgb_w)
 
@@ -398,25 +473,28 @@ def main(args):
         merged_xyz = np.concatenate(all_xyz, axis=0)
         merged_rgb = np.concatenate(all_rgb, axis=0)
         save_ply(os.path.join(merged_dir, "merged.ply"), merged_xyz, merged_rgb)
+        print(f"\n[pipeline] Merged cloud: {len(merged_xyz):,} points total.")
 
     # ── save all poses together ───────────────────────────────────────────
     if poses_np is not None:
-        np.save(os.path.join(pose_dir, "all_poses.npy"), poses_np)   # (S, 4, 4)
-        # also save rotation matrices only: (S, 3, 3)
-        np.save(os.path.join(pose_dir, "all_rotations.npy"), poses_np[:, :3, :3])
-        print(f"\n[pipeline] All poses saved → {pose_dir}/all_poses.npy")
+        np.save(os.path.join(pose_dir, "all_poses.npy"), poses_np)
+        np.save(
+            os.path.join(pose_dir, "all_rotations.npy"),
+            poses_np[:, :3, :3],
+        )
+        print(f"[pipeline] All poses ({S}) saved → {pose_dir}/all_poses.npy")
 
     print(f"\n✅ Done.  Results written to: {out_root}")
 
 
 # =========================================================================
-#  7.  Entry Point
+#  8.  Entry Point
 # =========================================================================
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="PanoVGGT Inference — depth, poses, point clouds")
-
+        description="PanoVGGT Inference — depth, poses, point clouds"
+    )
     # required
     p.add_argument("--config",      type=str, required=True,
                    help="Path to model YAML config file.")
@@ -424,7 +502,6 @@ def parse_args():
                    help="Path to model checkpoint (.pth / .pt).")
     p.add_argument("--image_dir",   type=str, required=True,
                    help="Directory containing panoramic input images.")
-
     # optional
     p.add_argument("--mask_dir",    type=str, default=None,
                    help="Directory containing masks (same stem as images). "
@@ -435,10 +512,9 @@ def parse_args():
                    choices=["cuda", "cpu"],
                    help="Compute device. (default: cuda)")
     p.add_argument("--log_depth",   action="store_true", default=True,
-                   help="Use logarithmic scale for depth visualisation. (default: True)")
+                   help="Use logarithmic scale for depth visualisation.")
     p.add_argument("--no_log_depth", dest="log_depth", action="store_false",
                    help="Disable logarithmic depth scale.")
-
     return p.parse_args()
 
 

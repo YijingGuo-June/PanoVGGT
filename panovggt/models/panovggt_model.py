@@ -356,16 +356,26 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
 
         # --- Global points branch ---
         if self.enable_global_points:
-            BN, P, C2 = tokens.shape
+            BN, P, C2 = tokens.shape  # BN == B*S
+
+            tokens_4d = tokens.reshape(B, S, P, C2)
 
             if self.training:
                 anchor_idx = torch.randint(0, S, (B,), device=tokens.device)
-                context = tokens[torch.arange(B), anchor_idx].unsqueeze(1).repeat(1, S, 1, 1)
+                context = (
+                    tokens_4d[torch.arange(B, device=tokens.device), anchor_idx]
+                    .unsqueeze(1)
+                    .expand(B, S, P, C2)
+                    .reshape(B * S, P, C2)
+                )
             else:
                 mid_idx = S // 2
-                context = tokens[:, mid_idx:mid_idx+1].repeat(1, S, 1, 1)
-            
-            context = context.reshape(B*S, P, C2)
+                context = (
+                    tokens_4d[:, mid_idx : mid_idx + 1]
+                    .expand(B, S, P, C2)
+                    .reshape(B * S, P, C2)
+                )
+
             pos_bs_global = self._get_branch_pos_embed(
                 patch_h, patch_w, patch_start_idx,
                 tokens.device, tokens.dtype, "global", B * S,
