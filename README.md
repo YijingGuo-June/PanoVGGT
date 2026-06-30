@@ -19,7 +19,8 @@ Yijing Guo, Mengjun Chao, Luo Wang, Tianyang Zhao, Haizhao Dai, Yingliang Zhang,
 
 ## Updates
 
-  - [April 2026] We have officially released the pre-trained model weights\! You can download them directly from [Hugging Face](https://huggingface.co/YijingGuo/PanoVGGT/resolve/main/model.pt).
+  - [April 2026] We have officially released the high-resolution pre-trained model weights\! You can download them directly from [Hugging Face](https://huggingface.co/YijingGuo/PanoVGGT/resolve/main/model.pt).
+  - [April 2026] We have also released the low-resolution checkpoint used for the paper's quantitative evaluation. Please see the checkpoint note below before reproducing results.
   - [March 2026] The PanoVGGT paper is now available on [arXiv](https://arxiv.org/abs/2603.17571).
   - [March 2026] We have released the [PanoCity Dataset](https://huggingface.co/datasets/YijingGuo/PanoCity) on Hugging Face\!
 
@@ -60,10 +61,24 @@ mkdir -p checkpoints
 wget https://huggingface.co/YijingGuo/PanoVGGT/resolve/main/model.pt -O checkpoints/model.pt
 ```
 
+### Checkpoint Note
+
+The released checkpoint [`model.pt`](https://huggingface.co/YijingGuo/PanoVGGT/resolve/main/model.pt) is our recommended high-resolution pre-trained weight. It was released after we completed the second-stage high-resolution training and is intended as the default checkpoint for inference, fine-tuning, and downstream pre-training. Compared with the low-resolution checkpoint, it brings a substantial performance improvement under high-resolution evaluation settings, since panoramic images contain dense visual information and downsampling removes many important details.
+
+For clarity, the quantitative results reported in our paper were **not** evaluated with `model.pt`. Similar to many VGGT-style methods, PanoVGGT follows a two-stage training recipe: first-stage training at `336 x 672`, followed by second-stage training at `518 x 1036`. During the paper deadline, the second-stage training had not yet been completed, so the paper reports results using the first-stage low-resolution checkpoint, evaluated under the high-resolution setting. In contrast, the compared methods were evaluated with their original settings, typically using high-resolution training and high-resolution testing, which makes the comparison somewhat unfavorable to PanoVGGT.
+
+If you want to reproduce the quantitative results in the paper, please use the low-resolution checkpoint:
+
+```bash
+wget https://huggingface.co/YijingGuo/PanoVGGT/resolve/main/model_lowres.pt -O checkpoints/model_lowres.pt
+```
+
+We do **not** recommend using `model_lowres.pt` as a general pre-trained checkpoint. For most use cases, please use the high-resolution [`model.pt`](https://huggingface.co/YijingGuo/PanoVGGT/resolve/main/model.pt).
+
 ## Repository Layout
 
-\<details\>
-\<summary\>Click to expand the project structure\</summary\>
+<details>
+<summary>Click to expand the project structure</summary>
 
 ```text
 .
@@ -75,7 +90,7 @@ wget https://huggingface.co/YijingGuo/PanoVGGT/resolve/main/model.pt -O checkpoi
 `-- requirements.txt       # Python dependencies
 ```
 
-\</details\>
+</details>
 
 ## Interactive Demo
 
@@ -118,6 +133,16 @@ To reproduce our quantitative results and evaluate the model's geometry and pose
 ```bash
 python evaluation/eval_allpano.py
 ```
+
+### High-resolution Results
+
+The following results are obtained with the released high-resolution checkpoint [`model.pt`](https://huggingface.co/YijingGuo/PanoVGGT/resolve/main/model.pt), trained at `518 x 1036` and evaluated at `518 x 1036` in the multi-view fusion setting with 3 input frames per sequence.
+
+| Dataset | # Seq. | AUC@30 ↑ | AUC@15 ↑ | AUC@5 ↑ | AUC@3 ↑ | Abs Rel ↓ | RMSE ↓ | δ < 1.25 ↑ | Global Overall Mean ↓ | Global Overall Med. ↓ |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| AerialGo | 253 | 0.998 | 0.996 | 0.987 | 0.978 | 0.026 | 5.765 | 0.977 | 1.817 | 0.609 |
+| Matterport3D | 129 | 0.902 | 0.854 | 0.701 | 0.581 | 0.052 | 0.218 | 0.971 | 0.059 | 0.034 |
+| Stanford2D3DS | 37 | 0.917 | 0.881 | 0.809 | 0.757 | 0.046 | 0.248 | 0.968 | 0.057 | 0.033 |
 
 ## Checklist / TODOs
 
